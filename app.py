@@ -1,6 +1,5 @@
 import base64
 import html
-import json
 import re
 from datetime import datetime, timedelta
 from io import BytesIO
@@ -89,13 +88,21 @@ def analyze_domain(raw_url: str):
         desc = soup.find("meta", attrs={"name": re.compile("description", re.I)})
         result["description"] = desc.get("content", "")[:300] if desc else ""
 
-        logo_candidates = []
+        logo_candidates, visual_candidates = [], []
+        og = soup.find("meta", attrs={"property": "og:image"})
+        if og and og.get("content"):
+            visual_candidates.append(urljoin(url, og.get("content")))
         for tag in soup.find_all(["img", "link", "meta"]):
             attrs = " ".join(str(v) for v in tag.attrs.values()).lower()
-            src = tag.get("src") or tag.get("href") or tag.get("content")
-            if src and ("logo" in attrs or "og:image" in attrs or "icon" in attrs):
-                logo_candidates.append(urljoin(url, src))
-        for candidate in logo_candidates[:8]:
+            src = tag.get("src") or tag.get("data-src") or tag.get("data-lazy-src") or tag.get("href") or tag.get("content")
+            if not src or str(src).startswith("data:"):
+                continue
+            absolute = urljoin(url, src)
+            if "logo" in attrs or "icon" in attrs:
+                logo_candidates.append(absolute)
+            else:
+                visual_candidates.append(absolute)
+        for candidate in logo_candidates[:10]:
             data_uri = fetch_image_data_uri(candidate)
             if data_uri:
                 result["logo"] = data_uri
@@ -103,6 +110,18 @@ def analyze_domain(raw_url: str):
                 if palette:
                     result.update(palette)
                 break
+        website_images = []
+        seen = set()
+        for candidate in visual_candidates[:35]:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            data_uri = fetch_image_data_uri(candidate)
+            if data_uri:
+                website_images.append(data_uri)
+            if len(website_images) >= 4:
+                break
+        result["website_images"] = website_images
     except Exception as exc:
         result["warning"] = f"Die Website konnte nicht vollständig analysiert werden: {exc.__class__.__name__}. Die Vorschau nutzt neutrale Startwerte."
         result.setdefault("brand", result["domain"].split(".")[0].title())
@@ -112,60 +131,48 @@ def analyze_domain(raw_url: str):
 
 def campaign_copy(domain: str, brand: str, description: str):
     text = f"{domain} {brand} {description}".lower()
+    # Branchenbezogen, aber bewusst markenneutral statt generischer Fashion-Sprache.
+    if any(k in text for k in ["tier", "pet", "hund", "katze", "fressnapf"]):
+        return {"eyebrow": "Nur für kurze Zeit", "headline": "Lieblingsprodukte zum Aktionsvorteil", "body": "Sichere dir ausgewählte Angebote für deinen tierischen Alltag, solange die Aktion läuft.", "cta": "Angebote entdecken", "subject": "Nur noch kurze Zeit: Aktionsvorteile sichern"}
     if any(k in text for k in ["reise", "travel", "hotel", "urlaub", "flug"]):
-        return {"eyebrow": "Nur für kurze Zeit", "headline": "Jetzt Vorfreude sichern", "body": "Buche dein ausgewähltes Angebot, bevor der Aktionszeitraum endet.", "cta": "Angebot entdecken", "subject": "Dein Angebot endet bald"}
-    if any(k in text for k in ["mode", "fashion", "bekleidung", "schuhe", "shop"]):
-        return {"eyebrow": "Limited Offer", "headline": "Dein Style. Dein Zeitfenster.", "body": "Sichere dir ausgewählte Favoriten zum Aktionspreis, solange die Aktion läuft.", "cta": "Jetzt entdecken", "subject": "Nur noch kurze Zeit: ausgewählte Styles"}
-    if any(k in text for k in ["tier", "pet", "hund", "katze"]):
-        return {"eyebrow": "Aktionsangebot", "headline": "Vorräte rechtzeitig auffüllen", "body": "Entdecke ausgewählte Lieblingsprodukte zum zeitlich begrenzten Vorteil.", "cta": "Vorteil sichern", "subject": "Countdown für deinen Aktionsvorteil"}
+        return {"eyebrow": "Nur für kurze Zeit", "headline": "Dein Reisevorteil endet bald", "body": "Entdecke das aktuelle Angebot und sichere dir deinen Vorteil innerhalb des Aktionszeitraums.", "cta": "Angebot entdecken", "subject": "Dein Reiseangebot endet bald"}
     if any(k in text for k in ["foto", "photo", "druck", "print"]):
-        return {"eyebrow": "Endspurt", "headline": "Deine Erinnerungen verdienen einen Platz", "body": "Gestalte dein Fotoprodukt innerhalb des Aktionszeitraums und sichere dir den Vorteil.", "cta": "Jetzt gestalten", "subject": "Nur noch kurze Zeit für dein Fotoprojekt"}
-    return {"eyebrow": "Zeitlich limitiert", "headline": "Jetzt Vorteil sichern", "body": "Entdecke das aktuelle Angebot, bevor der Aktionszeitraum endet.", "cta": "Angebot ansehen", "subject": "Dein Vorteil endet bald"}
+        return {"eyebrow": "Endspurt", "headline": "Jetzt Aktionsvorteil sichern", "body": "Gestalte dein Fotoprodukt innerhalb des Aktionszeitraums und sichere dir den aktuellen Vorteil.", "cta": "Jetzt gestalten", "subject": "Nur noch kurze Zeit für deinen Aktionsvorteil"}
+    if any(k in text for k in ["mode", "fashion", "bekleidung", "schuhe"]):
+        return {"eyebrow": "Limited Offer", "headline": "Ausgewählte Angebote nur für kurze Zeit", "body": "Entdecke aktuelle Favoriten zum Aktionspreis, solange die Aktion läuft.", "cta": "Jetzt entdecken", "subject": "Nur noch kurze Zeit: ausgewählte Angebote"}
+    return {"eyebrow": "Nur für kurze Zeit", "headline": "Aktionsvorteil endet bald", "body": "Entdecke ausgewählte Angebote und sichere dir deinen Vorteil, solange die Aktion läuft.", "cta": "Angebot ansehen", "subject": "Nur noch kurze Zeit: Vorteil sichern"}
 
 
-def build_email_html(data, copy, end_iso, colors, hero_url=""):
+def build_email_html(data, copy, end_iso, colors, hero_url="", selected_image=0):
     brand = html.escape(data.get("brand") or data.get("domain", "Marke"))
     logo = data.get("logo", "")
-    hero = fetch_image_data_uri(hero_url) if hero_url else ""
+    website_images = data.get("website_images", [])
+    hero = fetch_image_data_uri(hero_url) if hero_url else (website_images[selected_image] if website_images and selected_image < len(website_images) else "")
     p, a, bg, txt = [safe_hex(colors[k], DEFAULT_COLORS[k]) for k in ["primary", "accent", "background", "text"]]
-    logo_html = f'<img src="{logo}" alt="{brand}" style="max-width:150px;max-height:42px;object-fit:contain">' if logo else f'<div style="font-size:24px;font-weight:800;color:{p}">{brand}</div>'
-    hero_html = f'<img src="{hero}" alt="Kampagnenmotiv" style="width:100%;height:190px;object-fit:cover;display:block">' if hero else f'<div style="height:175px;background:linear-gradient(135deg,{p},{a});display:flex;align-items:center;justify-content:center;color:white;font-size:52px">✦</div>'
+    brand_mark = f'<img src="{logo}" alt="{brand}" style="max-width:115px;max-height:30px;object-fit:contain">' if logo else f'<span style="font-weight:800;color:{p}">{brand}</span>'
+    hero_html = f'<img src="{hero}" alt="Kampagnenmotiv von der Website" style="width:100%;height:188px;object-fit:cover;display:block">' if hero else f'<div style="height:150px;background:linear-gradient(135deg,{p},{a});display:flex;align-items:center;justify-content:center;color:white;font-size:42px">✦</div>'
     return f"""
-<div id="td-preview" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;background:#e9edf2;padding:18px;color:{txt}">
-  <div style="max-width:390px;margin:auto;background:#111;border:10px solid #111;border-radius:46px;padding:10px;box-shadow:0 18px 45px rgba(0,0,0,.25)">
-    <div style="height:24px;color:white;font-size:11px;display:flex;justify-content:space-between;padding:0 15px;align-items:center"><span>9:41</span><span>● ᴡɪꜰɪ ▰</span></div>
-    <div style="background:white;border-radius:31px;overflow:hidden;min-height:720px">
-      <div style="padding:13px 16px;border-bottom:1px solid #e8e8e8;display:flex;justify-content:space-between;color:#1d5fd0"><span>‹ Postfach</span><span>•••</span></div>
-      <div style="padding:14px 18px 10px"><div style="font-weight:750;font-size:16px">{html.escape(copy['subject'])}</div><div style="font-size:12px;color:#6b7280;margin-top:4px">{brand} · an mich</div></div>
-      <div style="background:{bg}">
-        <div style="background:white;padding:18px;text-align:center">{logo_html}</div>
-        {hero_html}
-        <div style="padding:24px 22px 28px;text-align:center">
-          <div style="font-size:12px;letter-spacing:1.6px;text-transform:uppercase;color:{p};font-weight:800">{html.escape(copy['eyebrow'])}</div>
-          <h1 style="font-size:28px;line-height:1.12;margin:10px 0 12px;color:{txt}">{html.escape(copy['headline'])}</h1>
-          <p style="font-size:15px;line-height:1.5;margin:0 0 18px;color:#4b5563">{html.escape(copy['body'])}</p>
-          <div data-end="{end_iso}" style="display:flex;justify-content:center;gap:7px;margin:18px 0 22px">
-            {''.join(f'<div style="min-width:58px;background:{p};color:white;border-radius:11px;padding:10px 5px"><div id="td-{key}" style="font-size:24px;font-weight:800">00</div><div style="font-size:9px;opacity:.8;text-transform:uppercase">{label}</div></div>' for key,label in [('days','Tage'),('hours','Std.'),('mins','Min.'),('secs','Sek.')])}
-          </div>
-          <a href="#" onclick="return false" style="display:inline-block;background:{a};color:{txt};text-decoration:none;font-weight:800;padding:13px 24px;border-radius:8px">{html.escape(copy['cta'])}</a>
-          <div style="font-size:10px;color:#8a8f98;margin-top:22px">Exemplarische trustedDialog Countdown Preview</div>
-        </div>
-      </div>
-    </div>
+<div id="td-preview" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;background:#f3f4f6;padding:10px;color:{txt}">
+ <div style="max-width:320px;margin:auto;background:linear-gradient(145deg,#181818,#4a4a4a);padding:3px;border-radius:45px;box-shadow:0 12px 30px rgba(0,0,0,.25)">
+  <div style="background:#f8f8f8;border:4px solid #111;border-radius:42px;overflow:hidden;min-height:690px;position:relative">
+   <div style="height:34px;display:grid;grid-template-columns:1fr 1.2fr 1fr;align-items:center;padding:0 18px;font-size:10px;font-weight:700"><span>09:35</span><span style="justify-self:center;width:92px;height:22px;border-radius:15px;background:#111"></span><span style="justify-self:end">▮▮ ◔ ▣</span></div>
+   <div style="height:56px;background:#fff;border-bottom:1px solid #eee;display:flex;align-items:center;padding:0 14px;gap:12px"><span style="font-size:30px;font-weight:200">‹</span><div style="flex:1"><div style="font-weight:800;font-size:14px">1 von 5</div><div style="font-size:10px;color:#aaa">trustedDialog Preview</div></div><div style="display:flex;gap:8px"><span style="background:#fafafa;box-shadow:0 2px 12px #ddd;border-radius:50%;width:37px;height:37px;display:grid;place-items:center">⌃</span><span style="background:#fafafa;box-shadow:0 2px 12px #ddd;border-radius:50%;width:37px;height:37px;display:grid;place-items:center">⌄</span></div></div>
+   <div style="height:34px;background:#f2f4f7;border-bottom:1px solid #e4e7eb;display:flex;align-items:center;justify-content:space-between;padding:0 13px;font-size:9px"><span style="background:white;border-radius:12px;padding:3px 8px;color:#4b76be">Newsletter</span><span style="color:#3675c5">Newsletter abbestellen&nbsp; ⚙</span></div>
+   <div style="background:white;display:flex;align-items:center;padding:12px 14px 9px;gap:9px"><div style="width:30px;height:30px;border-radius:50%;background:#caeaff;color:#3273a8;display:grid;place-items:center;font-weight:700">{brand[:1]}</div><div style="flex:1"><div style="font-size:13px;font-weight:750;color:#3976ba">{brand} ✓</div><div style="font-size:9px;color:#999">Heute um 09:32</div></div><span style="color:#aaa;font-size:11px">1 ›</span></div>
+   <div style="font-size:15px;font-weight:800;padding:12px 15px 16px;background:white;border-top:1px solid #f5f5f5">{html.escape(copy['subject'])}</div>
+   <div style="background:{bg};margin:0 10px 82px;border-radius:3px;overflow:hidden;box-shadow:0 1px 8px rgba(0,0,0,.05)">
+     <div style="background:#fff;padding:13px;text-align:center">{brand_mark}</div>{hero_html}
+     <div style="padding:17px 16px 20px;text-align:center"><div style="font-size:9px;letter-spacing:1.2px;text-transform:uppercase;color:{p};font-weight:800">{html.escape(copy['eyebrow'])}</div><div style="font-size:21px;line-height:1.15;font-weight:850;margin:7px 0;color:{txt}">{html.escape(copy['headline'])}</div><div style="font-size:12px;line-height:1.45;color:#555">{html.escape(copy['body'])}</div>
+     <div data-end="{end_iso}" style="display:flex;justify-content:center;gap:4px;margin:13px 0">{''.join(f'<div style="min-width:48px;background:{p};color:white;border-radius:6px;padding:7px 2px"><div id="td-{key}" style="font-size:18px;font-weight:850">00</div><div style="font-size:7px;opacity:.85;text-transform:uppercase">{label}</div></div>' for key,label in [('days','Tage'),('hours','Std.'),('mins','Min.'),('secs','Sek.')])}</div>
+     <a href="#" onclick="return false" style="display:inline-block;background:{a};color:{txt};text-decoration:none;font-weight:800;font-size:11px;padding:10px 18px;border-radius:5px">{html.escape(copy['cta'])}</a></div>
+   </div>
+   <div style="position:absolute;right:13px;bottom:65px;font-size:8px;color:#9aa0a6;background:rgba(255,255,255,.88);padding:3px 5px;border-radius:5px">KI-optimiert</div>
+   <div style="position:absolute;bottom:11px;left:18px;right:18px;display:flex;align-items:center;gap:17px"><div style="height:45px;flex:1;background:#fff;border-radius:24px;box-shadow:0 2px 14px #ddd;display:flex;align-items:center;justify-content:space-around;font-size:17px"><span>↪</span><span>♜</span><span>↶</span><span style="color:#6357e9">◴</span><span>•••</span></div><div style="width:45px;height:45px;border-radius:50%;background:#fff;box-shadow:0 2px 14px #ddd;display:grid;place-items:center;font-size:21px">↗</div></div>
+   <div style="position:absolute;bottom:2px;left:50%;transform:translateX(-50%);width:115px;height:4px;border-radius:4px;background:#111"></div>
   </div>
+ </div>
 </div>
-<script>
-(function(){{
- const root=document.getElementById('td-preview');
- const end=new Date(root.querySelector('[data-end]').dataset.end).getTime();
- function tick(){{
-   const d=Math.max(0,end-Date.now());
-   const vals={{days:Math.floor(d/86400000),hours:Math.floor(d/3600000)%24,mins:Math.floor(d/60000)%60,secs:Math.floor(d/1000)%60}};
-   Object.keys(vals).forEach(k=>root.querySelector('#td-'+k).textContent=String(vals[k]).padStart(2,'0'));
- }}
- tick(); setInterval(tick,1000);
-}})();
-</script>"""
+<script>(function(){{const root=document.getElementById('td-preview'),end=new Date(root.querySelector('[data-end]').dataset.end).getTime();function tick(){{const d=Math.max(0,end-Date.now()),v={{days:Math.floor(d/86400000),hours:Math.floor(d/3600000)%24,mins:Math.floor(d/60000)%60,secs:Math.floor(d/1000)%60}};Object.keys(v).forEach(k=>root.querySelector('#td-'+k).textContent=String(v[k]).padStart(2,'0'));}}tick();setInterval(tick,1000);}})();</script>"""
 
 st.title("trustedDialog Countdown Preview")
 st.caption("Unabhängiger Prototyp: Domain analysieren, CI-nahe E-Mail erzeugen und als geöffnete Mail im iPhone-Mockup darstellen.")
@@ -200,7 +207,12 @@ with left:
     cta = st.text_input("CTA", value=copy_default["cta"])
     end_date = st.date_input("Countdown-Enddatum", value=(datetime.now() + timedelta(days=7)).date())
     end_time = st.time_input("Endzeit", value=datetime.strptime("23:59", "%H:%M").time())
-    hero_url = st.text_input("Optional: Bild-URL", placeholder="https://…/kampagne.jpg")
+    imgs = data.get("website_images", [])
+    selected_image = 0
+    if imgs:
+        selected_image = st.selectbox("Website-Grafik", options=list(range(len(imgs))), format_func=lambda i: f"Website-Motiv {i+1}")
+        st.image(imgs[selected_image], caption="Automatisch von der Website übernommen", width=260)
+    hero_url = st.text_input("Optional: eigene Bild-URL überschreibt Website-Motiv", placeholder="https://…/kampagne.jpg")
     st.markdown("**Farben**")
     c1, c2 = st.columns(2)
     primary = c1.color_picker("Primär", data.get("primary", DEFAULT_COLORS["primary"]))
@@ -210,7 +222,7 @@ with left:
 
 copy = {"subject": subject, "eyebrow": eyebrow, "headline": headline, "body": body, "cta": cta}
 end_dt = datetime.combine(end_date, end_time)
-email_html = build_email_html(data, copy, end_dt.isoformat(), {"primary":primary,"accent":accent,"background":background,"text":text}, hero_url)
+email_html = build_email_html(data, copy, end_dt.isoformat(), {"primary":primary,"accent":accent,"background":background,"text":text}, hero_url, selected_image)
 
 with right:
     st.subheader("3. Live Preview")
